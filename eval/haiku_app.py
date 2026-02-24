@@ -24,7 +24,9 @@ image = (
 @app.function(
     image=image,
 )
-@modal.asgi_app()
+@modal.asgi_app(
+    custom_domains=["haiku.modal.dev"]
+)
 def serve_playground():
     from contextlib import asynccontextmanager
 
@@ -102,6 +104,11 @@ def serve_playground():
     @fastapi_app.get("/api/vocabs")
     async def get_vocabs():
         return MODAL_VOCABS
+
+    @fastapi_app.get("/assets/{filename:path}")
+    async def serve_asset(filename: str):
+        asset_path = Path("/root/eval/assets") / filename
+        return FileResponse(asset_path)
 
     @fastapi_app.get("/")
     async def index():

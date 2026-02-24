@@ -3,7 +3,24 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Haiku Playground</title>
+    <title>Haiku Playground — RL-trained haiku generation on Modal</title>
+    <meta name="description" content="Compare haiku generation across RL training checkpoints. A Qwen3-4B model fine-tuned with GRPO on Modal to write perfect 5-7-5 haikus.">
+    <meta name="keywords" content="haiku, AI haiku generator, reinforcement learning, GRPO, Qwen3, Modal, LLM fine-tuning, poetry generation">
+    <link rel="canonical" href="https://haiku.modal.dev/">
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Haiku Playground — RL-trained haiku generation on Modal">
+    <meta property="og:description" content="Compare haiku generation across RL training checkpoints. Qwen3-4B fine-tuned with GRPO to write perfect 5-7-5 haikus.">
+    <meta property="og:url" content="https://haiku.modal.dev/">
+    <meta property="og:image" content="https://haiku.modal.dev/assets/haiku_flower.png">
+    <meta property="og:site_name" content="Haiku Playground">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Haiku Playground — RL-trained haiku generation on Modal">
+    <meta name="twitter:description" content="Compare haiku generation across RL training checkpoints. Qwen3-4B fine-tuned with GRPO on Modal.">
+    <meta name="twitter:image" content="https://haiku.modal.dev/assets/haiku_flower.png">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=DM+Mono:wght@400;500&display=swap');
 
@@ -287,6 +304,36 @@
             font-family: 'DM Mono', monospace;
         }
 
+        .bg-flower {
+            position: fixed;
+            bottom: -10%;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90vmin;
+            height: 90vmin;
+            background: url('assets/haiku_flower.png') no-repeat center / contain;
+            opacity: 0.5;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container { position: relative; z-index: 1; }
+
+        .petal {
+            position: fixed;
+            pointer-events: none;
+            z-index: 0;
+            opacity: 0;
+            animation: petalFloat linear forwards;
+        }
+
+        @keyframes petalFloat {
+            0%   { opacity: 0; transform: translate(0, 0) rotate(0deg) scale(0.7); }
+            10%  { opacity: 0.7; }
+            90%  { opacity: 0.7; }
+            100% { opacity: 0; transform: translate(var(--dx), var(--dy)) rotate(var(--rot)) scale(1); }
+        }
+
         @media (max-width: 640px) {
             body { padding: 1rem; }
             header { flex-direction: column; gap: 0.25rem; }
@@ -296,6 +343,7 @@
     </style>
 </head>
 <body>
+    <div class="bg-flower"></div>
     <div class="container">
         <header>
             <h1>haiku playground</h1>
@@ -436,6 +484,47 @@
         });
 
         loadConfig();
+
+        // floating petals
+        const PETAL_PATHS = [
+            'M8 0C8 0 10 6 8 10C6 14 2 16 0 16C0 16 2 10 4 6C6 2 8 0 8 0Z',
+            'M6 0C6 0 9 4 9 8C9 12 6 16 3 16C0 16 0 12 2 8C4 4 6 0 6 0Z',
+            'M5 0C5 0 10 3 10 8C10 13 6 16 3 16C0 16 1 11 3 7C5 3 5 0 5 0Z',
+        ];
+        const GREENS = ['#4ade80','#22c55e','#16a34a','#86efac','#bbf7d0'];
+
+        function spawnPetal() {
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.setAttribute('viewBox', '0 0 16 16');
+            svg.classList.add('petal');
+
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d', PETAL_PATHS[Math.random() * PETAL_PATHS.length | 0]);
+            path.setAttribute('fill', GREENS[Math.random() * GREENS.length | 0]);
+            svg.appendChild(path);
+
+            const size = 22 + Math.random() * 20;
+            svg.style.width = size + 'px';
+            svg.style.height = size + 'px';
+            svg.style.left = (Math.random() * 100) + 'vw';
+            svg.style.top = (Math.random() * 100) + 'vh';
+
+            const dx = (Math.random() - 0.5) * 300;
+            const dy = -150 - Math.random() * 250;
+            const rot = (Math.random() - 0.5) * 720;
+            const dur = 6 + Math.random() * 8;
+
+            svg.style.setProperty('--dx', dx + 'px');
+            svg.style.setProperty('--dy', dy + 'px');
+            svg.style.setProperty('--rot', rot + 'deg');
+            svg.style.animationDuration = dur + 's';
+
+            document.body.appendChild(svg);
+            svg.addEventListener('animationend', () => svg.remove());
+        }
+
+        setInterval(spawnPetal, 350);
+        for (let i = 0; i < 20; i++) setTimeout(spawnPetal, i * 150);
     </script>
 </body>
 </html>

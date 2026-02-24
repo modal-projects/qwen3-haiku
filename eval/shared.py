@@ -76,7 +76,7 @@ MODEL_CONFIG = {
         iters_dir="iter_0000049",
         model_name="30b-judge-cl",
         model_description="Qwen3-4B Finetuned with 30B Judge using Curriculumn Learning",
-        label="30B Judge (CL)",
+        label="30B Judge",
     ),
     "30b-judge-cl": ModelConfig(
         model_path="2_24-30b-leveled-Qwen3-4B-20260224-180902",
