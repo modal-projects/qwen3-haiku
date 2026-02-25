@@ -7,7 +7,7 @@ from pathlib import Path
 import modal
 import modal.experimental
 
-from eval.shared import MODEL_CONFIG, ModelConfig, _to_class_name
+from eval.shared import MODEL_CONFIG, ModelConfig, _to_class_name, iter_dirs
 
 APP_NAME = "serve-haiku-model"
 
@@ -56,9 +56,6 @@ slime_image = (
 def get_hf_model_path(config: ModelConfig) -> str:
     return f"{MODELS_PATH / config.model_path / HF_DIR}"
 
-def get_megatron_checkpoint_path(config: ModelConfig) -> str:
-    return f"{MODELS_PATH / config.model_path / config.iters_dir}"
-
 @app.function(
     image=slime_image,
     timeout=24 * 60 * 60,
@@ -86,7 +83,7 @@ async def convert_checkpoint(
         print(f"Model {origin_hf_dir} already downloaded.")
 
     megatron_checkpoint_path = MODELS_PATH / model_path / iter_dir
-    output_hf_path = MODELS_PATH / model_path / HF_DIR
+    output_hf_path = MODELS_PATH / model_path / iter_dir / HF_DIR
 
     subprocess.run(f"PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py --input-dir {megatron_checkpoint_path} --output-dir {output_hf_path} --origin-hf-dir {local_hf_dir}", shell=True, check=True)
 
@@ -113,6 +110,7 @@ class _VLLMServerBase:
 
     # Subclasses set this as a class variable
     MODEL_KEY: str
+    ITER_DIR: str
 
     @modal.enter()
     def setup(self):
@@ -167,13 +165,13 @@ class _VLLMServerBase:
         return local_hf_dir
 
     def _setup_finetuned_model(self, model_config: ModelConfig) -> Path:
-        hf_path = MODELS_PATH / model_config.model_path / HF_DIR
+        hf_path = MODELS_PATH / model_config.model_path / self.ITER_DIR / HF_DIR
 
         if not hf_path.joinpath("config.json").exists():
             print(f"Converting checkpoint {model_config.model_path} to HuggingFace format...")
             convert_checkpoint.remote(
                 model_path=model_config.model_path,
-                iter_dir=model_config.iters_dir,
+                iter_dir=self.ITER_DIR,
                 origin_hf_dir=model_config.base_model_name,
             )
             checkpoints_volume.reload()
@@ -208,8 +206,9 @@ class _VLLMServerBase:
 
 
 for _model_key in MODEL_CONFIG:
-    _cls_name = _to_class_name(_model_key)
-    _cls = type(_cls_name, (_VLLMServerBase,), {"MODEL_KEY": _model_key})
-    _cls = modal.concurrent(target_inputs=4)(_cls)
-    _cls = app.cls(**CLS_KWARGS)(_cls)
-    globals()[_cls_name] = _cls
+    for iter_num, iter_dir in iter_dirs.items():
+        _cls_name = _to_class_name(_model_key, iter_num)
+        _cls = type(_cls_name, (_VLLMServerBase,), {"MODEL_KEY": _model_key, "ITER_DIR": iter_dir})
+        _cls = modal.concurrent(target_inputs=4)(_cls)
+        _cls = app.cls(**CLS_KWARGS)(_cls)
+        globals()[_cls_name] = _cls

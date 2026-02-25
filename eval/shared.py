@@ -15,31 +15,36 @@ FLASH_REGION = "us-east"
 WORKSPACE = "modal-labs"
 
 
-def _to_class_name(model_key: str) -> str:
+def _to_class_name(model_key: str, iter_num: int) -> str:
     """Convert model key like '235b-judge-cl' to '235bJudgeClServer'."""
-    return "".join(part.capitalize() for part in model_key.split("-")) + "Server"
+    return "".join(part.capitalize() for part in model_key.split("-")) + iter_num + "Server"
 
 
-def get_flash_url(model_key: str) -> str:
+def get_flash_url(model_key: str, iter_num: str = "50") -> str:
     """Get the Flash endpoint base URL for a given model key."""
-    cls_name = _to_class_name(model_key)
+    cls_name = _to_class_name(model_key, iter_num)
     return f"https://{WORKSPACE}-{ENVIRONMENT}--{APP_NAME}-{cls_name.lower()}.{FLASH_REGION}.modal.direct"
 
 
-def get_model_endpoint(model_key: str) -> str:
+def get_model_endpoint(model_key: str, iter_num: str = "50") -> str:
     """Return the full chat-completions URL for a given model key."""
-    return get_flash_url(model_key) + "/v1/chat/completions"
+    return get_flash_url(model_key, iter_num) + "/v1/chat/completions"
 
 
 # ---------------------------------------------------------------------------
 # Model registry (single source of truth for both serving and eval/playground)
 # ---------------------------------------------------------------------------
 
-
+iter_dirs = {
+    "10": "iter_0000009",
+    "20": "iter_0000019",
+    "30": "iter_0000029",
+    "40": "iter_0000039",
+    "50": "iter_0000049",
+}
 @dataclass
 class ModelConfig:
     model_path: str
-    iters_dir: str
     model_name: str
     model_description: str
     label: str
@@ -50,15 +55,13 @@ class ModelConfig:
     def badge(self) -> str:
         return "base" if self.is_base_model else "trained"
 
-    @property
-    def flash_url(self) -> str:
-        return get_flash_url(self.model_name)
+    def flash_url(self, iter_num: str = "50") -> str:
+        return get_flash_url(self.model_name, iter_num)
 
 
 MODEL_CONFIG = {
     "base-model": ModelConfig(
         model_path="Qwen3-4B",
-        iters_dir="",
         model_name="base-model",
         model_description="Qwen3-4B Base Model",
         label="Base Model",
@@ -66,38 +69,33 @@ MODEL_CONFIG = {
     ),
     "no-llm-model": ModelConfig(
         model_path="2-23-no-llm-Qwen3-4B-20260224-032404",
-        iters_dir="iter_0000049",
         model_name="no-llm-model",
         model_description="Qwen3-4B Finetuned with No LLM",
         label="No LLM Judge",
     ),
     "30b-judge": ModelConfig(
         model_path="2_24-30b-Qwen3-4B-20260224-184838",
-        iters_dir="iter_0000049",
-        model_name="30b-judge-cl",
-        model_description="Qwen3-4B Finetuned with 30B Judge using Curriculumn Learning",
+        model_name="30b-judge",
+        model_description="Qwen3-4B Finetuned with 30B Judge",
         label="30B Judge",
     ),
     "30b-judge-cl": ModelConfig(
         model_path="2_24-30b-leveled-Qwen3-4B-20260224-180902",
-        iters_dir="iter_0000049",
         model_name="30b-judge-cl",
         model_description="Qwen3-4B Finetuned with 30B Judge using Curriculumn Learning",
-        label="30B Judge (CL)",
+        label="30B Judge (Curriculum Learning)",
     ),
     "235b-judge": ModelConfig(
         model_path="2_24-235b-Qwen3-4B-20260224-174605",
-        iters_dir="iter_0000049",
         model_name="235b-judge",
         model_description="Qwen3-4B Finetuned with 235B Judge",
         label="235B Judge",
     ),
     "235b-judge-cl": ModelConfig(
         model_path="2_23-235b-leveled-Qwen3-4B-20260224-172832",
-        iters_dir="iter_0000049",
         model_name="235b-judge-cl",
         model_description="Qwen3-4B Finetuned with 235B Judge using Curriculumn Learning",
-        label="235B Judge (CL)",
+        label="235B Judge (Curriculum Learning)",
     ),
 }
 
@@ -114,7 +112,7 @@ MODEL_CHECKPOINTS = [
 ]
 
 # Maps model_key -> flash endpoint URL
-MODEL_URLS: dict[str, str] = {key: config.flash_url for key, config in MODEL_CONFIG.items()}
+MODEL_URLS: dict[str, str] = {key: config.flash_url() for key, config in MODEL_CONFIG.items()}
 
 # ---------------------------------------------------------------------------
 # Constants

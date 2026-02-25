@@ -41,6 +41,7 @@ def serve_playground():
         MODEL_CHECKPOINTS,
         build_system_prompt,
         get_model_endpoint,
+        iter_dirs,
         query_model,
     )
     from llm_judges.nlp import (
@@ -52,6 +53,7 @@ def serve_playground():
     class GenerateRequest(BaseModel):
         prompt: str
         model_key: str = "base-model"
+        iter_num: str = "50"
         include_vocab: bool = True
 
     @asynccontextmanager
@@ -70,7 +72,8 @@ def serve_playground():
         client = fastapi_app.state.http_client
         cmudict = fastapi_app.state.cmudict
 
-        endpoint = get_model_endpoint(request.model_key)
+        iter_num = request.iter_num if request.iter_num != "base" else "50"
+        endpoint = get_model_endpoint(request.model_key, iter_num)
         system_prompt = build_system_prompt(include_vocab=request.include_vocab)
 
         haiku = await query_model(
@@ -104,6 +107,10 @@ def serve_playground():
     @fastapi_app.get("/api/vocabs")
     async def get_vocabs():
         return MODAL_VOCABS
+
+    @fastapi_app.get("/api/iter_nums")
+    async def get_iter_nums():
+        return sorted(iter_dirs.keys(), key=int)
 
     @fastapi_app.get("/assets/{filename:path}")
     async def serve_asset(filename: str):
