@@ -23,7 +23,7 @@ VLLM_PORT = 8000
 
 
 # Same volume used in training
-checkpoints_volume: modal.Volume = modal.Volume.from_name("grpo-slime-haiku-checkpoints")
+checkpoints_volume: modal.Volume = modal.Volume.from_name("slime-haiku-checkpoints")
 hf_cache_vol = modal.Volume.from_name("huggingface-cache")
 vllm_cache_vol = modal.Volume.from_name("vllm-cache")
 
@@ -71,6 +71,7 @@ async def convert_checkpoint(
 ):
     """Convert Megatron checkpoint to HuggingFace format."""
     from huggingface_hub import snapshot_download
+    import os
     import subprocess
 
     await checkpoints_volume.reload.aio()
@@ -83,9 +84,42 @@ async def convert_checkpoint(
         print(f"Model {origin_hf_dir} already downloaded.")
 
     megatron_checkpoint_path = MODELS_PATH / model_path / iter_dir
-    output_hf_path = MODELS_PATH / model_path / iter_dir / HF_DIR
+    output_hf_path = MODELS_PATH / model_path / f"{iter_dir}_{HF_DIR}"
 
-    subprocess.run(f"PYTHONPATH=/root/Megatron-LM python tools/convert_torch_dist_to_hf.py --input-dir {megatron_checkpoint_path} --output-dir {output_hf_path} --origin-hf-dir {local_hf_dir}", shell=True, check=True)
+    script_path = Path("/root/tools/convert_torch_dist_to_hf.py")
+    if not script_path.exists():
+        raise RuntimeError(f"Conversion script not found at: {script_path}")
+
+    cmd = [
+        "python",
+        str(script_path),
+        "--input-dir",
+        str(megatron_checkpoint_path),
+        "--output-dir",
+        str(output_hf_path),
+        "--origin-hf-dir",
+        str(local_hf_dir),
+        "--force",
+    ]
+    print(f"Running conversion: {' '.join(cmd)}")
+    result = subprocess.run(
+        cmd,
+        cwd="/root",
+        env={**os.environ, "PYTHONPATH": "/root/Megatron-LM:/root"},
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout:
+        print(result.stdout)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Checkpoint conversion failed.\n"
+            f"input-dir={megatron_checkpoint_path}\n"
+            f"output-dir={output_hf_path}\n"
+            f"origin-hf-dir={local_hf_dir}\n"
+            f"STDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
+        )
 
 
 CLS_KWARGS = dict(
@@ -165,7 +199,7 @@ class _VLLMServerBase:
         return local_hf_dir
 
     def _setup_finetuned_model(self, model_config: ModelConfig) -> Path:
-        hf_path = MODELS_PATH / model_config.model_path / self.ITER_DIR / HF_DIR
+        hf_path = MODELS_PATH / model_config.model_path / f"{self.ITER_DIR}_{HF_DIR}"
 
         if not hf_path.joinpath("config.json").exists():
             print(f"Converting checkpoint {model_config.model_path} to HuggingFace format...")
