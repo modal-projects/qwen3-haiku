@@ -117,6 +117,11 @@ def serve_playground():
         asset_path = Path("/root/eval/assets") / filename
         return FileResponse(asset_path)
 
+    @fastapi_app.get("/haiku_tree.js")
+    async def serve_tree_script():
+        script_path = Path("/root/eval/haiku_tree.js")
+        return FileResponse(script_path, media_type="application/javascript")
+
     @fastapi_app.get("/")
     async def index():
         html_path = Path("/root/eval/haiku_playground.html")

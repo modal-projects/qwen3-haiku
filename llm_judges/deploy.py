@@ -30,7 +30,9 @@ MODEL_NAME = ACTIVE_JUDGE_MODEL_SIZE.model_name
 N_GPU = 1 if ACTIVE_JUDGE_MODEL_SIZE == JudgeModelSize.QWEN3_30B else 4
 MINUTES = 60
 
-checkpoint_volume = modal.Volume.from_name("unsloth-checkpoints")
+TARGET_INPUTS = 8
+MIN_CONTAINERS = 3
+
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
@@ -128,20 +130,19 @@ def create_fastapi_app(judge_type: JudgeType):
 @app.cls(
     image=image,
     gpu=f"H100:{N_GPU}",
-    min_containers=3,
+    min_containers=MIN_CONTAINERS,
     scaledown_window=15 * MINUTES,
     startup_timeout=15 * MINUTES,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
-        "/checkpoints": checkpoint_volume,
     },
     secrets=[modal.Secret.from_name("huggingface-secret")],
     experimental_options={"flash": "us-east"},
     region="us-east",
 )
 @modal.concurrent(  # how many requests can one replica handle? tune carefully!
-    target_inputs=8
+    target_inputs=TARGET_INPUTS
 )
 class LLMJudge:
     """Modal Flash endpoint combining vLLM + scoring logic in one container."""
