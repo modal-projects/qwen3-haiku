@@ -4,6 +4,8 @@
         return;
     }
     const treeCtx = treeCanvas.getContext('2d');
+    const mediaQuery = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+    let prefersReducedMotion = mediaQuery ? mediaQuery.matches : false;
     const branchTips = [];
     const TREE_SCALE_INITIAL = 1.75;
     const TREE_SCALE_SHRUNK = 1;
@@ -38,6 +40,15 @@
         spinBoost: 0.03,
         cruiseYawSpeed: 0.0026,
     };
+    let animationRunning = false;
+    let petalIntervalId = null;
+    let lastVisibilityState = document.visibilityState;
+
+    function getPetalIntervalMs() {
+        if (prefersReducedMotion) return 1400;
+        if (document.visibilityState === 'hidden') return 1800;
+        return 650;
+    }
 
     function triggerGenerateSpin() {
         const now = performance.now();
@@ -598,7 +609,31 @@
         treeCanvas.addEventListener('lostpointercapture', releasePointer);
     }
 
+    function startAnimation() {
+        if (animationRunning || document.visibilityState === 'hidden') return;
+        animationRunning = true;
+        rotationState.lastFrameTs = 0;
+        requestAnimationFrame(animateTree);
+    }
+
+    function stopAnimation() {
+        animationRunning = false;
+    }
+
+    function restartPetalInterval() {
+        if (petalIntervalId) {
+            clearInterval(petalIntervalId);
+            petalIntervalId = null;
+        }
+        if (document.visibilityState === 'hidden') return;
+        if (prefersReducedMotion) return;
+        petalIntervalId = setInterval(spawnPetal, getPetalIntervalMs());
+    }
+
     function animateTree(now = performance.now()) {
+        if (!animationRunning) {
+            return;
+        }
         if (!treeGenerated) {
             requestAnimationFrame(animateTree);
             return;
@@ -656,23 +691,27 @@
             drawPrism(treeCtx, item.branch, item.segment);
         }
 
-        const bloomBase = t - MAX_DEPTH * 270;
-        for (const tip of branchTips) {
-            const seed = Math.abs(Math.floor(tip.x * 1.7 + tip.y * 2.3 + tip.z * 3.1));
-            const delayMs = seed % 420;
-            const raw = (bloomBase - delayMs) / 760;
-            if (raw <= 0) continue;
-            const clamped = Math.min(1, raw);
-            const bloom = 1 - Math.pow(1 - clamped, 3);
-            drawLeaf(treeCtx, tip, bloom, now);
+        if (!prefersReducedMotion) {
+            const bloomBase = t - MAX_DEPTH * 270;
+            for (const tip of branchTips) {
+                const seed = Math.abs(Math.floor(tip.x * 1.7 + tip.y * 2.3 + tip.z * 3.1));
+                const delayMs = seed % 420;
+                const raw = (bloomBase - delayMs) / 760;
+                if (raw <= 0) continue;
+                const clamped = Math.min(1, raw);
+                const bloom = 1 - Math.pow(1 - clamped, 3);
+                drawLeaf(treeCtx, tip, bloom, now);
+            }
         }
 
         for (const node of treeNodes) {
             drawNode(treeCtx, node, t);
         }
 
-        updateEnergyDots(t, dt60);
-        drawEnergyDots(treeCtx);
+        if (!prefersReducedMotion) {
+            updateEnergyDots(t, dt60);
+            drawEnergyDots(treeCtx);
+        }
 
         treeCtx.restore();
         requestAnimationFrame(animateTree);
@@ -741,9 +780,27 @@
     resizeTreeCanvas();
     setupTreeInteraction();
     window.addEventListener('resize', resizeTreeCanvas);
-    requestAnimationFrame(animateTree);
-    setInterval(spawnPetal, 350);
-    for (let i = 0; i < 20; i++) setTimeout(spawnPetal, i * 150);
+    if (mediaQuery) {
+        mediaQuery.addEventListener('change', event => {
+            prefersReducedMotion = event.matches;
+            restartPetalInterval();
+        });
+    }
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === lastVisibilityState) return;
+        lastVisibilityState = document.visibilityState;
+        if (document.visibilityState === 'hidden') {
+            stopAnimation();
+        } else {
+            startAnimation();
+        }
+        restartPetalInterval();
+    });
+    startAnimation();
+    restartPetalInterval();
+    if (!prefersReducedMotion) {
+        for (let i = 0; i < 12; i++) setTimeout(spawnPetal, i * 180);
+    }
 
     window.haikuTree = {
         triggerGenerateSpin,

@@ -661,40 +661,68 @@
         let MODELS = [];
         let VOCABS = [];
         let ITER_NUMS = [];
+        let QUICK_PROMPTS = [];
         let LAST_ITER = '';
+        let ASSET_VERSION = '';
         let firstGeneration = true;
         let detailViewShown = false;
+        let detailViewInitialized = false;
+        let detailHoverBound = false;
+        let activeDetailHoverCellId = null;
         let lastPrompt = '';
         const CELL_TEXTS = new Map();
         let activeDetailDiffCellId = null;
 
-        async function loadConfig() {
-            const [modelsResp, vocabsResp, itersResp] = await Promise.all([
-                fetch('/api/models'),
-                fetch('/api/vocabs'),
-                fetch('/api/iter_nums'),
-            ]);
-            MODELS = await modelsResp.json();
-            VOCABS = await vocabsResp.json();
-            ITER_NUMS = await itersResp.json();
-            LAST_ITER = ITER_NUMS[ITER_NUMS.length - 1];
+        function perfMark(name) {
+            if (typeof performance === 'undefined' || typeof performance.mark !== 'function') return;
+            performance.mark(name);
+        }
 
+        function perfMeasure(name, startMark, endMark) {
+            if (typeof performance === 'undefined' || typeof performance.measure !== 'function') return;
+            try {
+                performance.measure(name, startMark, endMark);
+                const entries = performance.getEntriesByName(name);
+                const latest = entries[entries.length - 1];
+                if (latest) console.debug(`[perf] ${name}: ${latest.duration.toFixed(1)}ms`);
+            } catch (_) {}
+        }
+
+        function perfNow(name, value) {
+            console.debug(`[perf] ${name}: ${value.toFixed(1)}ms`);
+        }
+
+        function renderQuickPrompts() {
             const qp = document.getElementById('quick-prompts');
-            const prompts = [
-                {l:'cat',p:'Write me a haiku about cat.'},
-                {l:'ocean',p:'Write me a haiku about the ocean.'},
-                {l:'cherry blossoms',p:'Write me a haiku about cherry blossoms.'},
-                {l:'coding',p:'Write me a haiku about coding.'},
-                {l:'Modal',p:'Write me a haiku about Modal.'},
-                {l:'serverless',p:'Write me a haiku about serverless.'},
-            ];
-            qp.innerHTML = prompts.map(q =>
-                `<span class="quick-prompt" onclick="setPrompt('${q.p}')">${q.l}</span>`
-            ).join('');
+            qp.innerHTML = QUICK_PROMPTS.map(q => {
+                const prompt = String(q.prompt || '').replaceAll("'", "\\'");
+                const label = q.emoji ? `${q.emoji} ${q.label}` : q.label;
+                return `<span class="quick-prompt" onclick="setPrompt('${prompt}')">${label}</span>`;
+            }).join('');
+        }
+
+        async function loadConfig() {
+            perfMark('load-config-start');
+            const t0 = performance.now();
+            const bootstrapResp = await fetch('/api/bootstrap');
+            if (!bootstrapResp.ok) throw new Error(`HTTP ${bootstrapResp.status}`);
+            const bootstrap = await bootstrapResp.json();
+            perfNow('bootstrap_fetch', performance.now() - t0);
+            MODELS = bootstrap.models;
+            VOCABS = bootstrap.vocabs;
+            ITER_NUMS = bootstrap.iter_nums;
+            QUICK_PROMPTS = bootstrap.quick_prompts || [];
+            ASSET_VERSION = bootstrap.asset_version || '';
+            LAST_ITER = ITER_NUMS[ITER_NUMS.length - 1];
+            renderQuickPrompts();
 
             document.getElementById('vocab-list').textContent = VOCABS.join(', ');
+            perfMark('init-cards-start');
             initCards();
-            initDetailTable();
+            perfMark('init-cards-end');
+            perfMeasure('init_cards', 'init-cards-start', 'init-cards-end');
+            perfMark('first-interactive');
+            perfMeasure('load_config_total', 'load-config-start', 'first-interactive');
         }
 
         function toggleVocabHint() {
@@ -878,15 +906,32 @@
             activeDetailDiffCellId = baselineCellId;
         }
 
-        function bindDetailDiffHover() {
-            const cells = document.querySelectorAll('#detail-view .model-cell[data-model-name]');
-            cells.forEach(cell => {
-                cell.addEventListener('mouseenter', () => {
-                    if (activeDetailDiffCellId === cell.dataset.cellId) return;
-                    applyDetailDiffFromCell(cell);
-                });
-                cell.addEventListener('mouseleave', () => clearDetailDiff());
+        function bindDetailDiffHoverDelegated() {
+            if (detailHoverBound) return;
+            const detail = document.getElementById('detail-view');
+            detail.addEventListener('mouseover', event => {
+                const cell = event.target.closest('.model-cell[data-model-name]');
+                if (!cell || !detail.contains(cell)) return;
+                if (activeDetailHoverCellId === cell.dataset.cellId) return;
+                activeDetailHoverCellId = cell.dataset.cellId || null;
+                applyDetailDiffFromCell(cell);
             });
+            detail.addEventListener('mouseout', event => {
+                const fromCell = event.target.closest('.model-cell[data-model-name]');
+                if (!fromCell) return;
+                const toCell = event.relatedTarget && event.relatedTarget.closest
+                    ? event.relatedTarget.closest('.model-cell[data-model-name]')
+                    : null;
+                if (!toCell || !detail.contains(toCell)) {
+                    activeDetailHoverCellId = null;
+                    clearDetailDiff();
+                }
+            });
+            detail.addEventListener('mouseleave', () => {
+                activeDetailHoverCellId = null;
+                clearDetailDiff();
+            });
+            detailHoverBound = true;
         }
 
         // ── Card view (iter 50 / base only) ──
@@ -960,7 +1005,7 @@
                 <thead><tr>${headerCells}</tr></thead>
                 <tbody>${rows}</tbody>
             </table>`;
-            bindDetailDiffHover();
+            bindDetailDiffHoverDelegated();
         }
 
         // ── Shared query logic ──
@@ -1095,6 +1140,13 @@
 
             if (!detailViewShown) {
                 detailViewShown = true;
+                if (!detailViewInitialized) {
+                    perfMark('init-detail-start');
+                    initDetailTable();
+                    detailViewInitialized = true;
+                    perfMark('init-detail-end');
+                    perfMeasure('init_detail_table', 'init-detail-start', 'init-detail-end');
+                }
                 detail.classList.remove('hidden');
                 btn.textContent = 'hide checkpoints ↑';
 
@@ -1123,7 +1175,45 @@
             if (e.key === 'Enter') generateHaikus();
         });
 
-        loadConfig();
+        function loadTreeScript() {
+            if (window.haikuTree) return Promise.resolve();
+            return new Promise((resolve, reject) => {
+                perfMark('tree-script-requested');
+                const script = document.createElement('script');
+                script.src = `/haiku_tree.js?v=${encodeURIComponent(ASSET_VERSION || '0')}`;
+                script.async = true;
+                script.onload = () => {
+                    perfMark('tree-script-loaded');
+                    perfMeasure('tree_script_load', 'tree-script-requested', 'tree-script-loaded');
+                    resolve();
+                };
+                script.onerror = () => reject(new Error('Unable to load tree animation'));
+                document.body.appendChild(script);
+            });
+        }
+
+        function scheduleTreeScriptLoad() {
+            const startLoad = () => {
+                loadTreeScript().catch(err => console.debug(err.message));
+            };
+            if ('requestIdleCallback' in window) {
+                requestIdleCallback(startLoad, { timeout: 2000 });
+                return;
+            }
+            setTimeout(startLoad, 700);
+        }
+
+        (async () => {
+            perfMark('app-bootstrap-start');
+            await loadConfig();
+            perfMark('app-bootstrap-end');
+            perfMeasure('app_bootstrap', 'app-bootstrap-start', 'app-bootstrap-end');
+            requestAnimationFrame(() => {
+                requestAnimationFrame(scheduleTreeScriptLoad);
+            });
+        })().catch(err => {
+            console.debug(err.message);
+        });
     </script>
 </body>
 </html>

@@ -8,10 +8,12 @@ Usage:
     # Train model
     modal run modal_train.py::download_model
     modal run modal_train.py::prepare_dataset
-    modal run modal_train.py::train_single_node --run-name my-experiment
+    modal run modal_train.py::train --run-name my-experiment
+    modal run modal_train.py::train_all --run-name my-experiment
 
     # With local slime repo for development:
-    USE_LOCAL_SLIME=/path/to/slime modal run modal_train.py::train_single_node
+    USE_LOCAL_SLIME=/path/to/slime modal run -d modal_train.py::train_single_node
+    USE_LOCAL_SLIME=/path/to/slime modal run -d modal_train.py::train_all     
 
 Environment variables:
     USE_LOCAL_SLIME=/path     Path to local slime repo for development
@@ -26,7 +28,7 @@ import time
 from llm_judges.base import MODAL_VOCABS
 import modal
 
-from config import RLConfig, get_config, ACTIVE_JUDGE_TYPE, ACTIVE_JUDGE_MODEL_SIZE
+from config import RLConfig, get_config, JudgeType, JudgeModelSize
 
 
 # =============================================================================
@@ -49,8 +51,8 @@ image = (
     )
     .entrypoint([])
     .add_local_python_source("config", copy=True)
-    .add_local_dir("tools", remote_path="/root/tools", copy=True)
-    .add_local_dir("llm_judges", remote_path="/root/llm_judges", copy=True)
+    .add_local_dir("tools", remote_path="/root/tools", copy=True, ignore=["**/__pycache__", "**/*.pyc"])
+    .add_local_dir("llm_judges", remote_path="/root/llm_judges", copy=True, ignore=["**/__pycache__", "**/*.pyc"])
     .pip_install("nltk>=3.8.0")
 )
 
@@ -81,7 +83,7 @@ RAY_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
 
-app = modal.App(f"train-haiku-judge_{ACTIVE_JUDGE_TYPE.value}_{ACTIVE_JUDGE_MODEL_SIZE.shorthand}")
+app = modal.App("train-haiku")
 
 
 # =============================================================================
@@ -348,8 +350,8 @@ def prepare_dataset():
 )
 async def train(
     run_name: str = "qwen3-4b-haiku",
-    judge_type = ACTIVE_JUDGE_TYPE,
-    judge_model_size = ACTIVE_JUDGE_MODEL_SIZE,
+    judge_type: JudgeType = JudgeType.NO_LLM,
+    judge_model_size: JudgeModelSize = JudgeModelSize.QWEN3_30B,
 ):
     """Single-node GRPO training on Modal."""
     from datetime import datetime
@@ -369,3 +371,33 @@ async def train(
         print(f"Dashboard URL: {tunnel.url}")
         print(f"Experiment: {experiment_name}")
         await run_training(cfg, 1, SINGLE_NODE_MASTER_ADDR, experiment_name)
+
+
+# All judge configurations to train with
+ALL_JUDGE_CONFIGS = [
+    (JudgeType.NO_LLM, JudgeModelSize.QWEN3_30B),
+    (JudgeType.STRICT, JudgeModelSize.QWEN3_30B),
+    (JudgeType.STRICT, JudgeModelSize.QWEN3_235B),
+    (JudgeType.STRICT_LEVELED, JudgeModelSize.QWEN3_30B),
+    (JudgeType.STRICT_LEVELED, JudgeModelSize.QWEN3_235B),
+]
+
+
+@app.local_entrypoint()
+def train_all(run_name: str = "qwen3-4b-haiku"):
+    """Kick off concurrent training runs for all judge configurations."""
+    handles = []
+    for judge_type, judge_model_size in ALL_JUDGE_CONFIGS:
+        suffix = judge_type.value
+        if judge_type != JudgeType.NO_LLM:
+            suffix += f"-{judge_model_size.shorthand}"
+        tagged_name = f"{run_name}-{suffix}"
+
+        print(f"Spawning: {tagged_name}")
+        handle = train.spawn(run_name=tagged_name, judge_type=judge_type, judge_model_size=judge_model_size)
+        handles.append((tagged_name, handle))
+
+    print(f"\nSpawned {len(handles)} training runs. Waiting for completion...")
+    for name, handle in handles:
+        handle.get()
+        print(f"Completed: {name}")

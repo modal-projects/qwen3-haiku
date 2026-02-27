@@ -1,6 +1,9 @@
 """
 LLM-as-a-Judge Reward Model for SLIME GRPO training.
 
+Deploys all LLM-based judge combinations (JudgeType x JudgeModelSize).
+NO_LLM judges don't need remote deployment — they use local scoring.
+
 Uses CMUdict for syllable counting: https://github.com/cmusphinx/cmudict
 Recommended by various packages such as `syllables` and `nltk`.
 """
@@ -8,26 +11,19 @@ Recommended by various packages such as `syllables` and `nltk`.
 import asyncio
 import threading
 
-from config import ACTIVE_JUDGE_MODEL_SIZE, ACTIVE_JUDGE_TYPE, JudgeModelSize, JudgeType
+from config import JudgeModelSize, JudgeType, _judge_class_name
 import modal
 import modal.experimental
-
-
-# =============================================================================
 
 
 # =============================================================================
 # Modal App Setup
 # =============================================================================
 
-app = modal.App(f"llm-judge-{ACTIVE_JUDGE_MODEL_SIZE.shorthand}-{ACTIVE_JUDGE_TYPE.value}")
+app = modal.App("llm-judge")
 
 FLASH_PORT = 8000
 VLLM_PORT = 8001
-
-MODEL = ACTIVE_JUDGE_MODEL_SIZE.value
-MODEL_NAME = ACTIVE_JUDGE_MODEL_SIZE.model_name
-N_GPU = 1 if ACTIVE_JUDGE_MODEL_SIZE == JudgeModelSize.QWEN3_30B else 4
 MINUTES = 60
 
 TARGET_INPUTS = 8
@@ -41,6 +37,11 @@ def _make_judge(judge_type: JudgeType):
     from llm_judges.base import HaikuJudge
 
     return HaikuJudge(gate_style_on_structure=(judge_type == JudgeType.STRICT_LEVELED))
+
+
+def _n_gpu(model_size: JudgeModelSize) -> int:
+    return 1 if model_size == JudgeModelSize.QWEN3_30B else 4
+
 
 # =============================================================================
 
@@ -62,15 +63,16 @@ image = (
         "python -c \"import nltk; nltk.download('cmudict'); nltk.download('punkt_tab')\""
     )
     .add_local_dir("llm_judges", "/root/llm_judges")
+    .add_local_file("config.py", "/root/config.py")
 )
 
 
 # =============================================================================
-# Modal Flash Endpoint
+# FastAPI scoring app (created per-class at container startup)
 # =============================================================================
 
 
-def create_fastapi_app(judge_type: JudgeType):
+def create_fastapi_app(judge_type: JudgeType, model_name: str):
     from fastapi import FastAPI
     from pydantic import BaseModel
     import nltk
@@ -115,37 +117,28 @@ def create_fastapi_app(judge_type: JudgeType):
 
         async with aiohttp.ClientSession() as session:
             result = await judge.score_single(
-                MODEL_NAME, session, prompt, response_text, cmudict, label=request.label
+                model_name, session, prompt, response_text, cmudict, label=request.label
             )
 
         return float(result)
 
     @fastapi_app.get("/health")
     def health():
-        return {"status": "ok", "model": MODEL_NAME, "judge": judge_type.value}
+        return {"status": "ok", "model": model_name, "judge": judge_type.value}
 
     return fastapi_app
 
 
-@app.cls(
-    image=image,
-    gpu=f"H100:{N_GPU}",
-    min_containers=MIN_CONTAINERS,
-    scaledown_window=15 * MINUTES,
-    startup_timeout=15 * MINUTES,
-    volumes={
-        "/root/.cache/huggingface": hf_cache_vol,
-        "/root/.cache/vllm": vllm_cache_vol,
-    },
-    secrets=[modal.Secret.from_name("huggingface-secret")],
-    experimental_options={"flash": "us-east"},
-    region="us-east",
-)
-@modal.concurrent(  # how many requests can one replica handle? tune carefully!
-    target_inputs=TARGET_INPUTS
-)
-class LLMJudge:
+# =============================================================================
+# Base class — subclasses set JUDGE_TYPE and MODEL_SIZE as class variables
+# =============================================================================
+
+
+class _LLMJudgeBase:
     """Modal Flash endpoint combining vLLM + scoring logic in one container."""
+
+    JUDGE_TYPE: JudgeType
+    MODEL_SIZE: JudgeModelSize
 
     @modal.enter()
     def setup(self):
@@ -153,19 +146,23 @@ class LLMJudge:
 
         import uvicorn
 
+        model = self.MODEL_SIZE.value
+        model_name = self.MODEL_SIZE.model_name
+        n_gpu = _n_gpu(self.MODEL_SIZE)
+
         # Start vLLM on VLLM_PORT (internal)
         cmd = [
             "vllm",
             "serve",
             "--uvicorn-log-level=info",
-            MODEL,
+            model,
             "--served-model-name",
-            MODEL_NAME,
+            model_name,
             "--port",
             str(VLLM_PORT),
             "--enforce-eager",
             "--tensor-parallel-size",
-            str(N_GPU),
+            str(n_gpu),
             "--max-model-len",
             "8192",
         ]
@@ -177,7 +174,7 @@ class LLMJudge:
         print(f"vLLM ready on port {VLLM_PORT}")
 
         # Start FastAPI scoring endpoint on FLASH_PORT (exposed)
-        self._fastapi_app = create_fastapi_app(ACTIVE_JUDGE_TYPE)
+        self._fastapi_app = create_fastapi_app(self.JUDGE_TYPE, model_name)
         config = uvicorn.Config(
             self._fastapi_app,
             host="0.0.0.0",
@@ -190,7 +187,7 @@ class LLMJudge:
 
         self._wait_for_port(FLASH_PORT, timeout=30)
         self.flash_manager = modal.experimental.flash_forward(FLASH_PORT)
-        print(f"Flash endpoint ready on port {FLASH_PORT} (judge={ACTIVE_JUDGE_TYPE.value})")
+        print(f"Flash endpoint ready on port {FLASH_PORT} (judge={self.JUDGE_TYPE.value})")
 
     def _wait_for_port(self, port: int, timeout: int = 30):
         import socket
@@ -220,3 +217,35 @@ class LLMJudge:
         if hasattr(self, "_vllm_process"):
             self._vllm_process.terminate()
             self._vllm_process.wait(timeout=10)
+
+
+# =============================================================================
+# Deploy all LLM-based judge combinations (NO_LLM doesn't need deployment)
+# =============================================================================
+
+_LLM_JUDGE_TYPES = [JudgeType.STRICT, JudgeType.STRICT_LEVELED]
+
+for _judge_type in _LLM_JUDGE_TYPES:
+    for _model_size in JudgeModelSize:
+        _cls_name = _judge_class_name(_judge_type, _model_size)
+        _cls = type(_cls_name, (_LLMJudgeBase,), {
+            "JUDGE_TYPE": _judge_type,
+            "MODEL_SIZE": _model_size,
+        })
+        _n = _n_gpu(_model_size)
+        _cls = modal.concurrent(target_inputs=TARGET_INPUTS)(_cls)
+        _cls = app.cls(
+            image=image,
+            gpu=f"H100:{_n}",
+            min_containers=MIN_CONTAINERS,
+            scaledown_window=15 * MINUTES,
+            startup_timeout=15 * MINUTES,
+            volumes={
+                "/root/.cache/huggingface": hf_cache_vol,
+                "/root/.cache/vllm": vllm_cache_vol,
+            },
+            secrets=[modal.Secret.from_name("huggingface-secret")],
+            experimental_options={"flash": "us-east"},
+            region="us-east",
+        )(_cls)
+        globals()[_cls_name] = _cls
