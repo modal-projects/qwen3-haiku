@@ -158,6 +158,11 @@ def serve_playground():
             cache_control=immutable_cache,
         )
 
+    @fastapi_app.get("/haiku_tree.js")
+    async def serve_tree_script():
+        script_path = Path("/root/eval/haiku_tree.js")
+        return FileResponse(script_path, media_type="application/javascript")
+
     @fastapi_app.get("/")
     async def index():
         return timed_file_response(
