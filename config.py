@@ -9,8 +9,8 @@ from pathlib import Path
 
 
 class JudgeType(str, Enum):
-    STRICT = "strict"
-    STRICT_LEVELED = "strict-leveled"
+    STRICT = "strict" # Without curriculum learning
+    STRICT_LEVELED = "strict-leveled" # Curriculumn learning
     NO_LLM = "no-llm"  # only use the structure score
 
 class JudgeModelSize(str, Enum):
@@ -44,6 +44,18 @@ def _judge_class_name(judge_type: JudgeType, judge_model_size: JudgeModelSize) -
     return f"{type_part}{judge_model_size.shorthand.capitalize()}"
 
 
+def _get_judge_url(judge_type: JudgeType, judge_model_size: JudgeModelSize) -> str:
+    cls_name = _judge_class_name(judge_type, judge_model_size)
+    return f"https://modal-labs-joy-dev--llm-judge-{cls_name.lower()}.us-east.modal.direct"
+
+
+def _get_reward_model_args_from_judge_type(judge_type: JudgeType, judge_model_size: JudgeModelSize) -> str:
+    if judge_type == JudgeType.STRICT or judge_type == JudgeType.STRICT_LEVELED:
+        return f"""--rm-type remote_rm
+            --rm-url {_get_judge_url(judge_type, judge_model_size)}/score"""
+    elif judge_type == JudgeType.NO_LLM:
+        return """--rm-type async_rm
+            --custom-rm-path llm_judges.nlp.haiku_rm"""
 
 @dataclass
 class RLConfig:
@@ -129,18 +141,6 @@ DEFAULT_GRPO_ARGS = """
 
 # ── Config factory ──
 
-def _get_judge_url(judge_type: JudgeType, judge_model_size: JudgeModelSize) -> str:
-    cls_name = _judge_class_name(judge_type, judge_model_size)
-    return f"https://modal-labs-joy-dev--llm-judge-{cls_name.lower()}.us-east.modal.direct"
-
-
-def _get_reward_model_args_from_judge_type(judge_type: JudgeType, judge_model_size: JudgeModelSize) -> str:
-    if judge_type == JudgeType.STRICT or judge_type == JudgeType.STRICT_LEVELED:
-        return f"""--rm-type remote_rm
-            --rm-url {_get_judge_url(judge_type, judge_model_size)}/score"""
-    elif judge_type == JudgeType.NO_LLM:
-        return """--rm-type async_rm
-            --custom-rm-path llm_judges.nlp.haiku_rm"""
 
 def get_config(run_name: str = "qwen3-4b-haiku", judge_type: JudgeType = JudgeType.NO_LLM, judge_model_size: JudgeModelSize = JudgeModelSize.QWEN3_30B) -> RLConfig:
     return RLConfig(
