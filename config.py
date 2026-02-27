@@ -7,11 +7,6 @@ from pathlib import Path
 
 
 
-_MODEL_INFO = {
-    "Qwen/Qwen3-30B-A3B-Instruct-2507": ("qwen3-30b-a3b-instruct", "30b"),
-    "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": ("qwen3-235b-a22b-instruct-fp8", "235b"),
-}
-
 
 class JudgeType(str, Enum):
     STRICT = "strict"
@@ -22,18 +17,31 @@ class JudgeModelSize(str, Enum):
     QWEN3_30B = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     QWEN3_235B = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
 
+
     @property
     def model_name(self) -> str:
-        return _MODEL_INFO[self.value][0]
+        if self.value == self.QWEN3_30B:
+            return "qwen3-30b-a3b-instruct"
+        elif self.value == self.QWEN3_235B:
+            return "qwen3-235b-a22b-instruct-fp8"
+        else:
+            raise ValueError(f"Unknown judge model size: {self.value}")
 
     @property
     def shorthand(self) -> str:
-        return _MODEL_INFO[self.value][1]
+        if self.value == self.QWEN3_30B:
+            return "30b"
+        elif self.value == self.QWEN3_235B:
+            return "235b"
+        else:
+            raise ValueError(f"Unknown judge model size: {self.value}")
 
 
 
-ACTIVE_JUDGE_TYPE = JudgeType.NO_LLM
-ACTIVE_JUDGE_MODEL_SIZE = JudgeModelSize.QWEN3_30B
+def _judge_class_name(judge_type: JudgeType, judge_model_size: JudgeModelSize) -> str:
+    """Generate Modal class name for a judge combo, e.g. 'Strict30b'."""
+    type_part = "".join(part.capitalize() for part in judge_type.value.split("-"))
+    return f"{type_part}{judge_model_size.shorthand.capitalize()}"
 
 
 
@@ -122,7 +130,8 @@ DEFAULT_GRPO_ARGS = """
 # ── Config factory ──
 
 def _get_judge_url(judge_type: JudgeType, judge_model_size: JudgeModelSize) -> str:
-    return f"https://modal-labs-joy-dev--llm-judge-{judge_model_size.shorthand}-{judge_type.value}-llmjudge.us-east.modal.direct"
+    cls_name = _judge_class_name(judge_type, judge_model_size)
+    return f"https://modal-labs-joy-dev--llm-judge-{cls_name.lower()}.us-east.modal.direct"
 
 
 def _get_reward_model_args_from_judge_type(judge_type: JudgeType, judge_model_size: JudgeModelSize) -> str:
@@ -133,7 +142,7 @@ def _get_reward_model_args_from_judge_type(judge_type: JudgeType, judge_model_si
         return """--rm-type async_rm
             --custom-rm-path llm_judges.nlp.haiku_rm"""
 
-def get_config(run_name: str = "qwen3-4b-haiku", judge_type = ACTIVE_JUDGE_TYPE, judge_model_size = ACTIVE_JUDGE_MODEL_SIZE) -> RLConfig:
+def get_config(run_name: str = "qwen3-4b-haiku", judge_type: JudgeType = JudgeType.NO_LLM, judge_model_size: JudgeModelSize = JudgeModelSize.QWEN3_30B) -> RLConfig:
     return RLConfig(
         model_name="Qwen3-4B",
         model_id="Qwen/Qwen3-4B",
