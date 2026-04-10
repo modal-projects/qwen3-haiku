@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(modal shell:*)",
+      "Bash(modal --help:*)",
+      "Bash(modal container:*)",
+      "Bash(ls:*)",
+      "Bash(gh api:*)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(EXPERIMENT_CONFIG=qwen3_4b_haiku modal run:*)"
+    ]
+  }
+}

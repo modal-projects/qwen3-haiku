@@ -1,5 +1,5 @@
 """
-LLM-as-a-Judge Reward Model for SLIME GRPO training.
+LLM-as-a-Judge Reward Model for slime GRPO training.
 
 Deploys all LLM-based judge combinations (JudgeType x JudgeModelSize).
 NO_LLM judges don't need remote deployment — they use local scoring.
@@ -36,11 +36,13 @@ vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 def _make_judge(judge_type: JudgeType):
     from llm_judges.base import HaikuJudge
 
-    return HaikuJudge(gate_style_on_structure=(judge_type == JudgeType.STRICT_LEVELED))
+    return HaikuJudge(gate_style_on_structure=(judge_type == JudgeType.CURRICULUM_LEARNING))
 
 
 def _n_gpu(model_size: JudgeModelSize) -> int:
-    return 1 if model_size == JudgeModelSize.QWEN3_30B else 4
+    if model_size in (JudgeModelSize.QWEN3_4B, JudgeModelSize.QWEN3_30B):
+        return 1
+    return 4
 
 
 # =============================================================================
@@ -223,7 +225,7 @@ class _LLMJudgeBase:
 # Deploy all LLM-based judge combinations (NO_LLM doesn't need deployment)
 # =============================================================================
 
-_LLM_JUDGE_TYPES = [JudgeType.STRICT, JudgeType.STRICT_LEVELED]
+_LLM_JUDGE_TYPES = [JudgeType.STANDARD, JudgeType.CURRICULUM_LEARNING]
 
 for _judge_type in _LLM_JUDGE_TYPES:
     for _model_size in JudgeModelSize:

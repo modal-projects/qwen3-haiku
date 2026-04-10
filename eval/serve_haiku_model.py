@@ -1,4 +1,4 @@
-"""Serve SLIME-trained Haiku models with vLLM.
+"""Serve slime-trained Haiku models with vLLM.
 
 modal deploy eval.serve_haiku_model
 """

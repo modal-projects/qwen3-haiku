@@ -1,403 +1,357 @@
 """
-SLIME GRPO Haiku training script for Modal.
+slime GRPO Haiku training -- Modal launcher.
 
-Usage:
-    # deploy
-    modal deploy llm_judges.deploy
+Three main entrypoints:
+    modal run modal_train.py::prepare     # generate configs, download model, prepare data, deploy judges
+    modal run modal_train.py::train       # kick off all training runs
+    modal run modal_train.py::evaluate    # deploy model servers and run evals
 
-    # Train model
-    modal run modal_train.py::download_model
-    modal run modal_train.py::prepare_dataset
-    modal run modal_train.py::train --run-name my-experiment
-    modal run modal_train.py::train_all --run-name my-experiment
-
-    # With local slime repo for development:
-    USE_LOCAL_SLIME=/path/to/slime modal run -d modal_train.py::train_single_node
-    USE_LOCAL_SLIME=/path/to/slime modal run -d modal_train.py::train_all     
-
-Environment variables:
-    USE_LOCAL_SLIME=/path     Path to local slime repo for development
+Other utilities:
+    modal run modal_train.py::list_configs
 """
 
+import asyncio
 import os
+import shlex
 import subprocess
-from pathlib import Path
-from typing import Optional
+import tempfile
 import time
 
-from llm_judges.base import MODAL_VOCABS
 import modal
+import modal.experimental
 
-from config import RLConfig, get_config, JudgeType, JudgeModelSize
+from configs import get_module, _CONFIGS_DIR
+from configs.base import HF_CACHE_PATH, DATA_PATH, CHECKPOINTS_PATH, YAML_CONFIG_FIELDS
 
+# -- Experiment (client-side only -- feeds decorator params)
+experiment = os.environ.get("EXPERIMENT_CONFIG", "")
+exp_mod = get_module(experiment) if experiment else None
+modal_cfg = exp_mod.modal if exp_mod else None
+slime_cfg = exp_mod.slime if exp_mod else None
 
-# =============================================================================
-# Modal Image & Volumes
-# =============================================================================
-
-# Path to local slime repo for development (e.g., USE_LOCAL_SLIME=/path/to/slime)
-# Set to a directory path to overlay local slime code, or leave unset to use registry image
-LOCAL_SLIME_PATH = os.environ.get("USE_LOCAL_SLIME", "")
+# -- Image
+slime_ROOT = "/root/slime"
 
 image = (
-    modal.Image.from_registry("slimerl/slime:nightly-dev-20260126a")
-    .run_commands(
-        "uv pip install --system git+https://github.com/huggingface/transformers.git@eebf856",  # 4.54.1
-        "uv pip install --system aiohttp",  # For LLM judge reward model
-        """sed -i 's/AutoImageProcessor.register(config, None, image_processor, None, exist_ok=True)/AutoImageProcessor.register(config, slow_image_processor_class=image_processor, exist_ok=True)/g' /sgl-workspace/sglang/python/sglang/srt/configs/utils.py""",
-        # Fix rope_theta access for transformers 5.x (moved to rope_parameters dict)
-        r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/glm/glm45_bridge.py""",
-        r"""sed -i 's/hf_config\.rope_theta/hf_config.rope_parameters["rope_theta"]/g' /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/qwen/qwen3_bridge.py""",
-    )
+    modal.Image.from_registry("slimerl/slime:nightly-dev-20260329a")
     .entrypoint([])
+    .add_local_python_source("configs", copy=True)
+    .add_local_python_source("llm_judges", copy=True)
     .add_local_python_source("config", copy=True)
-    .add_local_dir("tools", remote_path="/root/tools", copy=True, ignore=["**/__pycache__", "**/*.pyc"])
-    .add_local_dir("llm_judges", remote_path="/root/llm_judges", copy=True, ignore=["**/__pycache__", "**/*.pyc"])
-    .pip_install("nltk>=3.8.0")
 )
-
-# Overlay local slime code for development
-# Install slime to /opt/slime-dev (not /root/slime) to avoid sys.path conflicts when Ray runs scripts
-SLIME_DEV_PATH = "/opt/slime-dev"
-if LOCAL_SLIME_PATH:
-    # Copy the entire slime repo (has pyproject.toml) and install it
-    image = image.add_local_dir(LOCAL_SLIME_PATH, remote_path=SLIME_DEV_PATH, copy=True, ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv", "**/modal"]).run_commands(f"uv pip install --system -e {SLIME_DEV_PATH}")
-else:
-    SLIME_DEV_PATH = None
+if modal_cfg:
+    for patch in modal_cfg.patch_files:
+        image = image.add_local_file(
+            patch, f"/tmp/{os.path.basename(patch)}", copy=True
+        )
+    if modal_cfg.image_run_commands:
+        image = image.run_commands(*modal_cfg.image_run_commands)
+    if modal_cfg.local_slime:
+        image = image.add_local_dir(
+            modal_cfg.local_slime,
+            remote_path=slime_ROOT,
+            copy=True,
+            ignore=["**/__pycache__", "**/*.pyc", "**/.git", "**/.venv"],
+        )
 
 with image.imports():
     import ray
     from ray.job_submission import JobSubmissionClient
 
-# Paths
-HF_CACHE_PATH = "/root/.cache/huggingface"
-DATA_PATH: Path = Path(f"{HF_CACHE_PATH}/processed")
-CHECKPOINTS_PATH: Path = Path("/checkpoints")
+# -- Volumes
+hf_cache_volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
+data_volume = modal.Volume.from_name("slime-data", create_if_missing=True)
+checkpoints_volume = modal.Volume.from_name("slime-checkpoints", create_if_missing=True)
 
-# Volumes
-hf_cache_vol: modal.Volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
-checkpoints_volume: modal.Volume = modal.Volume.from_name("slime-haiku-checkpoints", create_if_missing=True)
+modal_volumes = {
+    str(HF_CACHE_PATH): hf_cache_volume,
+    str(DATA_PATH): data_volume,
+    str(CHECKPOINTS_PATH): checkpoints_volume,
+}
 
-# Ray configuration
-RAY_PORT = 6379
-RAY_DASHBOARD_PORT = 8265
-SINGLE_NODE_MASTER_ADDR = "127.0.0.1"
+# -- App
+app = modal.App(experiment or "train-haiku")
 
-app = modal.App("train-haiku")
-
-
-# =============================================================================
-# Ray Initialization
-# =============================================================================
-
-
-def _init_ray(rank: int, main_node_addr: str, node_ip_addr: str, n_nodes: int):
-    """Initialize Ray cluster across Modal containers.
-
-    Rank 0 starts the head node, opens a tunnel to the Ray dashboard, and waits
-    for all worker nodes to connect. Other ranks start as workers and connect
-    to the head node address.
-    """
-    os.environ["SLIME_HOST_IP"] = node_ip_addr
-
-    if rank == 0:
-        print(f"Starting Ray head node at {node_ip_addr}")
-        subprocess.Popen(
-            [
-                "ray",
-                "start",
-                "--head",
-                f"--node-ip-address={node_ip_addr}",
-                "--dashboard-host=0.0.0.0",
-            ]
-        )
-
-        for _ in range(30):
-            try:
-                ray.init(address="auto")
-            except ConnectionError:
-                time.sleep(1)
-                continue
-            print("Connected to Ray")
-            break
-        else:
-            raise Exception("Failed to connect to Ray")
-
-        for _ in range(60):
-            print("Waiting for worker nodes to connect...")
-            alive_nodes = [n for n in ray.nodes() if n["Alive"]]
-            print(f"Alive nodes: {len(alive_nodes)}/{n_nodes}")
-
-            if len(alive_nodes) == n_nodes:
-                print("All worker nodes connected")
-                break
-            time.sleep(1)
-        else:
-            raise Exception("Failed to connect to all worker nodes")
-    else:
-        print(f"Starting Ray worker node at {node_ip_addr}, connecting to {main_node_addr}")
-        subprocess.Popen(
-            [
-                "ray",
-                "start",
-                f"--node-ip-address={node_ip_addr}",
-                "--address",
-                f"{main_node_addr}:{RAY_PORT}",
-            ]
-        )
+# -- All haiku experiment configs (base + judge variants)
+ALL_HAIKU_CONFIGS = [
+    "qwen3_4b_haiku",
+    "qwen3_4b_haiku_standard_4b",
+    "qwen3_4b_haiku_standard_30b",
+    "qwen3_4b_haiku_standard_235b",
+    "qwen3_4b_haiku_cl_4b",
+    "qwen3_4b_haiku_cl_30b",
+    "qwen3_4b_haiku_cl_235b",
+]
 
 
 # =============================================================================
-# Training Command Generation
-# =============================================================================
-
-
-def generate_slime_cmd(
-    config: RLConfig,
-    master_addr: str,
-    experiment_name: str,
-) -> tuple[str, dict]:
-    """Generate the slime training command and runtime environment."""
-    import datetime
-    import random
-
-    train_args = config.generate_train_args(DATA_PATH)
-
-    checkpoint_dir = CHECKPOINTS_PATH / experiment_name
-    train_args += f" --save {checkpoint_dir} --save-interval {config.save_steps if hasattr(config, 'save_steps') else 10}"
-
-    # Add wandb args if API key is available
-    wandb_key = os.environ.get("WANDB_API_KEY")
-    if wandb_key:
-        run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%y%m%d-%H%M%S") + f"-{random.randint(0, 999):03d}"
-        wandb_run_name = f"{config.wandb_run_name_prefix}_{run_id}" if config.wandb_run_name_prefix else run_id
-        train_args += f" --use-wandb --wandb-project {config.wandb_project} --wandb-group {wandb_run_name} --wandb-key '{wandb_key}' --disable-wandb-random-suffix"
-
-    # Build PYTHONPATH by appending to existing (don't clobber)
-    import os as _os
-    existing_pythonpath = _os.environ.get("PYTHONPATH", "")
-    megatron_path = "/root/Megatron-LM/"
-    pythonpath = f"{megatron_path}:{existing_pythonpath}" if existing_pythonpath else megatron_path
-
-    runtime_env = {
-        "env_vars": {
-            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-            "NCCL_NVLS_ENABLE": "1",
-            "no_proxy": master_addr,
-            "MASTER_ADDR": master_addr,
-            # Megatron-LM requires PYTHONPATH (pip install doesn't work due to package name mismatch)
-            # slime is pip installed so doesn't need to be on PYTHONPATH
-            "PYTHONPATH": pythonpath,
-        }
-    }
-
-    # Use full path when local slime is installed
-    # Note: config.train_script returns "slime/train.py" for base image,
-    # but local repo has train.py at root level
-    # Check at runtime if dev path exists (USE_LOCAL_SLIME is only set during image build)
-    dev_path = "/opt/slime-dev"
-    if os.path.exists(dev_path):
-        train_script = f"{dev_path}/train.py"
-    else:
-        train_script = "slime/train.py"
-
-    return f"python3 {train_script} {train_args}", runtime_env
-
-
-async def run_training(
-    config: RLConfig,
-    n_nodes: int,
-    master_addr: str,
-    experiment_name: str, 
-):
-    """Submit SLIME training job to Ray cluster and stream logs."""
-    client = JobSubmissionClient("http://127.0.0.1:8265")
-
-    slime_cmd, runtime_env = generate_slime_cmd(config, master_addr, experiment_name)
-
-    print("Submitting training job...")
-    print(f"  Model: {config.model_name}")
-    print(f"  Nodes: {n_nodes}")
-    print(f"  Experiment: {experiment_name}")
-    print(f"  Checkpoint dir: {CHECKPOINTS_PATH / experiment_name}")
-
-    job_id = client.submit_job(entrypoint=slime_cmd, runtime_env=runtime_env)
-    print(f"Job submitted with ID: {job_id}")
-
-    async for line in client.tail_job_logs(job_id):
-        print(line, end="", flush=True)
-
-    await checkpoints_volume.commit.aio()
-    print("Checkpoints saved and committed to volume")
-
-        
-
-
-# =============================================================================
-# Modal Functions
+# Remote functions
 # =============================================================================
 
 
 @app.function(
     image=image,
-    volumes={HF_CACHE_PATH: hf_cache_vol},
+    volumes={str(HF_CACHE_PATH): hf_cache_volume},
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=24 * 60 * 60,
+    timeout=2 * 60 * 60,
 )
-def download_model(
-    revision: Optional[str] = None,
-):
-    """Download model from HuggingFace."""
+def _download_model(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Download the model to the HF cache volume."""
     from huggingface_hub import snapshot_download
 
-    cfg = get_config()
-
-    path = snapshot_download(
-        repo_id=cfg.model_id,
-        revision=revision,
-    )
+    slime_cfg = get_module(experiment).slime
+    path = snapshot_download(repo_id=slime_cfg.hf_checkpoint)
     print(f"Model downloaded to {path}")
-
-    hf_cache_vol.commit()
-
-
+    hf_cache_volume.commit()
 
 
 @app.function(
     image=image,
-    volumes={HF_CACHE_PATH: hf_cache_vol},
-    secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=24 * 60 * 60,
-)
-def prepare_dataset():
-    """Download and prepare the Haiku dataset."""
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
-
-    cfg = get_config()
-
-    hf_cache_vol.reload()
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
-    
-    ds = load_dataset("statworx/haiku")
-    
-    def format_chat_template(example, tokenizer):
-        system_prompt = f"You are a haiku poet. You will be given a prompt and you will need to write a haiku about the prompt. Try to incorporate these words into the haiku if possible: {', '.join(MODAL_VOCABS)}"
-
-        keyword = example['keywords'].lower()
-        question = f"Write me a haiku about {keyword}."
-
-        messages = [
-            {"content": system_prompt, "role": "system"},
-            {"content": question, "role": "user"},
-        ]
-
-        return {
-            "question": question,
-            "label": example["text"],
-            "messages": messages,
-            "prompt": tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=False),
-        }
-    
-    # this dataset only has "train", but no "test", so we manually split out the last 20% of the train dataset as test
-    # and remove them from the train dataset
-    test_size = min(1000, int(len(ds["train"]) * 0.2))
-    test_ds = ds["train"].select(range(len(ds["train"]) - test_size, len(ds["train"])))
-    ds["train"] = ds["train"].select(range(len(ds["train"]) - test_size))  # Keep first 80%
-    ds["test"] = test_ds
-    
-    train_transformed = ds["train"].map(lambda example: format_chat_template(example, tokenizer), remove_columns=["keywords"])
-    test_transformed = ds["test"].map(lambda example: format_chat_template(example, tokenizer), remove_columns=["keywords"])
-    
-    # Save as parquet
-    DATA_PATH.mkdir(parents=True, exist_ok=True)
-    (DATA_PATH / "haiku").mkdir(parents=True, exist_ok=True)
-    train_transformed.to_parquet(f"{DATA_PATH}/haiku/train.parquet")
-    test_transformed.to_parquet(f"{DATA_PATH}/haiku/test.parquet")
-    
-    hf_cache_vol.commit()
-    print("Haiku dataset prepared successfully")
-    print(f"Train examples: {len(train_transformed)}")
-    print(f"Test examples: {len(test_transformed)}")
-    print("\nExample:")
-    print(f"Prompt: {train_transformed[0]['question']}")
-    print(f"Text: {train_transformed[0]['label']}")
-
-
-
-
-# =============================================================================
-# CLI Entry Points
-# =============================================================================
-
-
-@app.function(
-    image=image,
-    gpu="H200:8",
     volumes={
-        HF_CACHE_PATH: hf_cache_vol,
-        CHECKPOINTS_PATH.as_posix(): checkpoints_volume,
+        str(HF_CACHE_PATH): hf_cache_volume,
+        str(DATA_PATH): data_volume,
     },
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    timeout=2 * 60 * 60,
+)
+def _prepare_dataset(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Run prepare_data() to populate the data volume."""
+    slime_cfg = get_module(experiment).slime
+    hf_cache_volume.reload()
+    data_volume.reload()
+    slime_cfg.prepare_data()
+    data_volume.commit()
+
+
+# -- Ray helpers
+RAY_PORT = 6379
+RAY_DASHBOARD_PORT = 8265
+
+
+def _start_ray_head(my_ip: str, n_nodes: int) -> None:
+    """Start Ray head node and wait for all workers to join."""
+    subprocess.Popen(
+        ["ray", "start", "--head", f"--node-ip-address={my_ip}", "--dashboard-host=0.0.0.0"]
+    )
+    for _ in range(30):
+        try:
+            ray.init(address="auto")
+            break
+        except ConnectionError:
+            time.sleep(1)
+    else:
+        raise RuntimeError("Ray head node failed to start")
+
+    for _ in range(60):
+        alive = [n for n in ray.nodes() if n["Alive"]]
+        print(f"Waiting for workers: {len(alive)}/{n_nodes} alive")
+        if len(alive) == n_nodes:
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError(f"Timed out waiting for all {n_nodes} Ray nodes to join")
+
+
+def _prepare_slime_cfg(slime_cfg, tmpdir: str) -> None:
+    """Resolve HF repo IDs to local paths and materialize inline YAML configs to temp files."""
+    from huggingface_hub import snapshot_download
+    import yaml
+
+    for attr in ("hf_checkpoint", "load", "ref_load", "critic_load"):
+        if (val := getattr(slime_cfg, attr, None)) and not str(val).startswith("/"):
+            setattr(slime_cfg, attr, snapshot_download(val, local_files_only=True))
+
+    for field in YAML_CONFIG_FIELDS:
+        if isinstance(val := getattr(slime_cfg, field, None), dict):
+            path = os.path.join(tmpdir, f"{field}.yaml")
+            with open(path, "w") as f:
+                yaml.dump(val, f)
+            print(f"Materialized {field} -> {path}")
+            setattr(slime_cfg, field, path)
+
+
+def _build_train_cmd(slime_cfg) -> str:
+    """Build the Ray job entrypoint, sourcing model arch args if slime_model_script is set."""
+    train_script = (
+        f"{slime_ROOT}/{'train_async.py' if slime_cfg.async_mode else 'train.py'}"
+    )
+    if slime_cfg.slime_model_script:
+        inner = (
+            f"source {slime_ROOT}/{slime_cfg.slime_model_script} && "
+            f"python3 {train_script} ${{MODEL_ARGS[@]}} {shlex.join(slime_cfg.cli_args())}"
+        )
+        return f"bash -c {shlex.quote(inner)}"
+    return f"python3 {train_script} {shlex.join(slime_cfg.cli_args())}"
+
+
+@app.function(
+    image=image,
+    gpu=f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}" if modal_cfg else None,
+    volumes=modal_volumes,
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name("wandb-secret"),
         modal.Secret.from_name("anthropic-secret"),
     ],
     timeout=24 * 60 * 60,
-    experimental_options={
-        "efa_enabled": True,
-    },
+    experimental_options={"efa_enabled": True},
 )
-async def train(
-    run_name: str = "qwen3-4b-haiku",
-    judge_type: JudgeType = JudgeType.NO_LLM,
-    judge_model_size: JudgeModelSize = JudgeModelSize.QWEN3_30B,
-):
-    """Single-node GRPO training on Modal."""
-    from datetime import datetime
+@(
+    modal.experimental.clustered(slime_cfg.total_nodes(), rdma=True)
+    if slime_cfg
+    else lambda fn: fn
+)
+async def _train_single(experiment: str = os.environ.get("EXPERIMENT_CONFIG", "")):
+    """Single training run on a GPU cluster."""
+    await asyncio.gather(hf_cache_volume.reload.aio(), data_volume.reload.aio())
+    exp_mod = get_module(experiment)
+    slime_cfg = exp_mod.slime
+    modal_cfg = exp_mod.modal
 
-    cfg = get_config(run_name=run_name, judge_type=judge_type, judge_model_size=judge_model_size)
+    if slime_cfg.total_nodes() > 1:
+        info = modal.experimental.get_cluster_info()
+        rank, master_addr, my_ip = (
+            info.rank,
+            info.container_ipv4_ips[0],
+            info.container_ipv4_ips[info.rank],
+        )
+        n_nodes = len(info.container_ipv4_ips)
+    else:
+        rank, master_addr, my_ip, n_nodes = 0, "127.0.0.1", "127.0.0.1", 1
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    model_short = cfg.model_name.split("/")[-1]
-    experiment_name = f"{run_name}-{model_short}-{timestamp}"
+    os.environ["slime_HOST_IP"] = my_ip
 
-    await hf_cache_vol.reload.aio()
-    await checkpoints_volume.reload.aio()
+    if rank != 0:
+        subprocess.Popen(
+            ["ray", "start", f"--node-ip-address={my_ip}", "--address", f"{master_addr}:{RAY_PORT}"]
+        )
+        while True:
+            await asyncio.sleep(10)
 
-    _init_ray(0, SINGLE_NODE_MASTER_ADDR, SINGLE_NODE_MASTER_ADDR, 1)
+    _start_ray_head(my_ip, n_nodes)
+    _prepare_slime_cfg(slime_cfg, tempfile.mkdtemp())
+
+    if (wandb_key := os.environ.get("WANDB_API_KEY", "")) and getattr(
+        slime_cfg, "use_wandb", False
+    ):
+        slime_cfg.wandb_key = wandb_key
+
+    cmd = _build_train_cmd(slime_cfg)
+    runtime_env = {
+        "env_vars": {
+            "no_proxy": f"127.0.0.1,{master_addr}",
+            "MASTER_ADDR": master_addr,
+            **slime_cfg.environment,
+        }
+    }
+
+    client = JobSubmissionClient("http://127.0.0.1:8265")
+    job_id = client.submit_job(entrypoint=cmd, runtime_env=runtime_env)
+    nodes = slime_cfg.total_nodes()
+    gpu = f"{modal_cfg.gpu}:{slime_cfg.actor_num_gpus_per_node}"
+    mode = "async" if slime_cfg.async_mode else "sync"
+    print(f"Job submitted: {job_id}")
+    print(f"Training {experiment:<40} {nodes} node(s) x {gpu}  ({mode})")
+    print(f"Command: {cmd}")
 
     async with modal.forward(RAY_DASHBOARD_PORT) as tunnel:
-        print(f"Dashboard URL: {tunnel.url}")
-        print(f"Experiment: {experiment_name}")
-        await run_training(cfg, 1, SINGLE_NODE_MASTER_ADDR, experiment_name)
+        print(f"Ray dashboard: {tunnel.url}")
+        async for line in client.tail_job_logs(job_id):
+            print(line, end="", flush=True)
+
+    await checkpoints_volume.commit.aio()
+    print("Checkpoints committed to volume")
 
 
-# All judge configurations to train with
-ALL_JUDGE_CONFIGS = [
-    (JudgeType.NO_LLM, JudgeModelSize.QWEN3_30B),
-    (JudgeType.STRICT, JudgeModelSize.QWEN3_30B),
-    (JudgeType.STRICT, JudgeModelSize.QWEN3_235B),
-    (JudgeType.STRICT_LEVELED, JudgeModelSize.QWEN3_30B),
-    (JudgeType.STRICT_LEVELED, JudgeModelSize.QWEN3_235B),
-]
+# =============================================================================
+# Local entrypoints
+# =============================================================================
 
 
 @app.local_entrypoint()
-def train_all(run_name: str = "qwen3-4b-haiku"):
-    """Kick off concurrent training runs for all judge configurations."""
-    handles = []
-    for judge_type, judge_model_size in ALL_JUDGE_CONFIGS:
-        suffix = judge_type.value
-        if judge_type != JudgeType.NO_LLM:
-            suffix += f"-{judge_model_size.shorthand}"
-        tagged_name = f"{run_name}-{suffix}"
+def list_configs():
+    """Print all available experiments."""
+    _skip = {"base", "__init__", "generate_judge_variants"}
+    names = sorted(f.stem for f in _CONFIGS_DIR.glob("*.py") if f.stem not in _skip)
+    print("Available experiments:")
+    for name in names:
+        mod = get_module(name)
+        nodes = mod.slime.total_nodes()
+        gpu = f"{mod.modal.gpu}:{mod.slime.actor_num_gpus_per_node}"
+        mode = "async" if mod.slime.async_mode else "sync"
+        print(f"  {name:<50} {nodes} node(s) x {gpu}  ({mode})")
 
-        print(f"Spawning: {tagged_name}")
-        handle = train.spawn(run_name=tagged_name, judge_type=judge_type, judge_model_size=judge_model_size)
-        handles.append((tagged_name, handle))
+
+@app.local_entrypoint()
+def prepare():
+    """Generate configs, download model, prepare dataset, and deploy LLM judges.
+
+    Usage:
+        modal run modal_train.py::prepare
+    """
+    import sys
+
+    base_config = "qwen3_4b_haiku"
+
+    # 1. Generate judge variant configs
+    print("=== Generating judge variant configs ===")
+    subprocess.run(
+        [sys.executable, "configs/generate_judge_variants.py"],
+        check=True,
+    )
+
+    # 2. Download model
+    print("\n=== Downloading model ===")
+    _download_model.remote(experiment=base_config)
+
+    # 3. Prepare dataset
+    print("\n=== Preparing dataset ===")
+    _prepare_dataset.remote(experiment=base_config)
+
+    # 4. Deploy LLM judges
+    print("\n=== Deploying LLM judges ===")
+    subprocess.run(["modal", "deploy", "llm_judges/deploy.py"], check=True)
+
+    print("\n=== Prepare complete ===")
+
+
+@app.local_entrypoint()
+def train():
+    """Kick off concurrent training runs for all haiku judge configurations.
+
+    Usage:
+        modal run modal_train.py::train
+    """
+    handles = []
+    for config_name in ALL_HAIKU_CONFIGS:
+        print(f"Spawning: {config_name}")
+        handle = _train_single.spawn(experiment=config_name)
+        handles.append((config_name, handle))
 
     print(f"\nSpawned {len(handles)} training runs. Waiting for completion...")
     for name, handle in handles:
         handle.get()
         print(f"Completed: {name}")
+
+
+@app.local_entrypoint()
+def evaluate():
+    """Deploy model servers and run evals for all models.
+
+    Usage:
+        modal run modal_train.py::evaluate
+    """
+    from eval.shared import MODEL_CONFIG
+    from eval.run_eval import run_eval
+
+    # 1. Deploy model serving endpoints
+    print("=== Deploying model servers ===")
+    subprocess.run(["modal", "deploy", "eval/serve_haiku_model.py"], check=True)
+
+    # 2. Run evals for each model
+    print("\n=== Running evaluations ===")
+    for model_key in MODEL_CONFIG:
+        print(f"\n--- Evaluating: {model_key} ---")
+        asyncio.run(run_eval(model_key=model_key))
+
+    print("\n=== Evaluation complete ===")
